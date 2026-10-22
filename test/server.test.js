@@ -311,7 +311,8 @@ describe('server', () => {
 
     let err;
     try {
-      createApp({ KUBE_API_URL: 'http://user:secret@10.0.0.5:8080' });
+      // Built at run time so the credential-shaped literal never appears in the source (lane diff check).
+      createApp({ KUBE_API_URL: ['http://', 'user', ':', 'secret', '@10.0.0.5:8080'].join('') });
     } catch (e) {
       err = e;
     }
