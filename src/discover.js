@@ -136,10 +136,8 @@ export function cardsFromObjects(
     sections.get(section).push(card);
   }
 
-  const result = {};
-  for (const [section, cards] of sections) {
+  for (const cards of sections.values()) {
     cards.sort((a, b) => compareCaseInsensitive(a.name, b.name));
-    result[section] = cards;
   }
 
   const orderedSections = [...sections.keys()].sort((a, b) => {
@@ -148,9 +146,7 @@ export function cardsFromObjects(
     return compareCaseInsensitive(a, b);
   });
 
-  const output = {};
-  for (const section of orderedSections) {
-    output[section] = result[section];
-  }
-  return output;
+  // Build the result from the Map so a section called `__proto__` or `constructor` becomes an own
+  // property instead of mutating the prototype chain.
+  return Object.fromEntries(orderedSections.map((section) => [section, sections.get(section)]));
 }

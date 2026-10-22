@@ -9,6 +9,7 @@ import { pathToFileURL } from 'node:url';
 import { cardsFromObjects, DEFAULT_EXCLUDED_NAMESPACES } from './discover.js';
 
 const REQUEST_TIMEOUT_MS = 5000;
+const BODY_LIMIT_BYTES = 8 * 1024 * 1024;
 const INGRESSROUTES_PATH = '/apis/traefik.io/v1alpha1/ingressroutes';
 const INGRESSES_PATH = '/apis/networking.k8s.io/v1/ingresses';
 const WARNING_STALE = '110 - "stale"';
@@ -21,11 +22,25 @@ class ApiError extends Error {
   }
 }
 
+// The default in-cluster API URL. An IPv6 KUBERNETES_SERVICE_HOST must be bracketed.
+export function defaultApiUrl(host, port) {
+  const plain = String(host);
+  const hostPart = plain.includes(':') ? `[${plain}]` : plain;
+  return `https://${hostPart}:${port}`;
+}
+
+const defaultLogger = {
+  info: (line) => process.stdout.write(`${line}\n`),
+  error: (line) => process.stderr.write(`${line}\n`),
+};
+
 function parseConfig(config) {
   const env = process.env;
   const excludedRaw = config.EXCLUDED_NAMESPACES ?? env.EXCLUDED_NAMESPACES;
+  const host = config.KUBERNETES_SERVICE_HOST ?? env.KUBERNETES_SERVICE_HOST;
+  const port = config.KUBERNETES_SERVICE_PORT ?? env.KUBERNETES_SERVICE_PORT;
   return {
-    apiUrl: (config.KUBE_API_URL ?? env.KUBE_API_URL ?? `https://${env.KUBERNETES_SERVICE_HOST}:${env.KUBERNETES_SERVICE_PORT}`).replace(/\/+$/, ''),
+    apiUrl: (config.KUBE_API_URL ?? env.KUBE_API_URL ?? defaultApiUrl(host, port)).replace(/\/+$/, ''),
     tokenFile: config.KUBE_TOKEN_FILE ?? env.KUBE_TOKEN_FILE ?? '/var/run/secrets/kubernetes.io/serviceaccount/token',
     caFile: config.KUBE_CA_FILE ?? env.KUBE_CA_FILE ?? '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt',
     cacheSeconds: Number(config.CACHE_SECONDS ?? env.CACHE_SECONDS ?? 30),
@@ -33,10 +48,23 @@ function parseConfig(config) {
       excludedRaw === undefined
         ? DEFAULT_EXCLUDED_NAMESPACES
         : String(excludedRaw).split(',').map((s) => s.trim()).filter(Boolean),
+    logger: config.logger ?? defaultLogger,
   };
 }
 
-function getJson(url, { token, ca }) {
+// The path for the access log: pathname only, never the query string (it can carry secrets).
+function accessPath(req) {
+  try {
+    return new URL(req.url || '/', 'http://x').pathname;
+  } catch {
+    return (req.url || '/').split('?')[0];
+  }
+}
+
+// GET url as JSON. Bounded by a 5 s total deadline (a slow or huge body must not hold the
+// single-flight refresh slot forever) and an 8 MiB body cap; `requests` collects the in-flight
+// request so close() can cancel it.
+function getJson(url, { token, ca, requests }) {
   return new Promise((resolve, reject) => {
     let target;
     try {
@@ -60,13 +88,34 @@ function getJson(url, { token, ca }) {
     };
     if (secure) options.ca = ca;
 
-    const req = transport(options, (res) => {
+    let settled = false;
+    let deadline = null;
+    let req = null;
+    const settle = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      if (deadline !== null) clearTimeout(deadline);
+      if (req !== null) requests.delete(req);
+      fn(value);
+    };
+
+    req = transport(options, (res) => {
       const chunks = [];
-      res.on('data', (chunk) => chunks.push(chunk));
+      let received = 0;
+      res.on('data', (chunk) => {
+        received += chunk.length;
+        if (received > BODY_LIMIT_BYTES) {
+          const tooLarge = new Error('upstream body exceeds the limit');
+          tooLarge.name = 'BodyTooLarge';
+          req.destroy(tooLarge);
+          return;
+        }
+        chunks.push(chunk);
+      });
       res.on('end', () => {
         const status = res.statusCode;
         if (status < 200 || status >= 300) {
-          reject(new ApiError(status));
+          settle(reject, new ApiError(status));
           return;
         }
         const text = Buffer.concat(chunks).toString('utf8');
@@ -74,16 +123,19 @@ function getJson(url, { token, ca }) {
         try {
           parsed = JSON.parse(text);
         } catch {
-          reject(new Error('malformed JSON response'));
+          settle(reject, new Error('malformed JSON response'));
           return;
         }
-        resolve(parsed);
+        settle(resolve, parsed);
       });
     });
+    requests.add(req);
+    // Total deadline from the start of the request, in addition to the socket inactivity timeout.
+    deadline = setTimeout(() => req.destroy(new Error('timeout')), REQUEST_TIMEOUT_MS);
     req.on('timeout', () => {
       req.destroy(new Error('request timeout'));
     });
-    req.on('error', (err) => reject(err));
+    req.on('error', (err) => settle(reject, err));
     req.end();
   });
 }
@@ -91,6 +143,7 @@ function getJson(url, { token, ca }) {
 export function createApp(config = {}) {
   const cfg = parseConfig(config);
 
+  const pendingRequests = new Set(); // in-flight upstream requests, cancelled by close()
   let lastGood = null; // serialized services.json body of the last successful refresh
   let lastGoodAt = 0;
   let lastAttemptAt = 0;
@@ -103,8 +156,8 @@ export function createApp(config = {}) {
         cfg.apiUrl.startsWith('https://') ? readFile(cfg.caFile) : Promise.resolve(undefined),
       ]);
       const [ingressRoutes, ingresses] = await Promise.all([
-        getJson(`${cfg.apiUrl}${INGRESSROUTES_PATH}`, { token, ca }),
-        getJson(`${cfg.apiUrl}${INGRESSES_PATH}`, { token, ca }),
+        getJson(`${cfg.apiUrl}${INGRESSROUTES_PATH}`, { token, ca, requests: pendingRequests }),
+        getJson(`${cfg.apiUrl}${INGRESSES_PATH}`, { token, ca, requests: pendingRequests }),
       ]);
       if (!Array.isArray(ingressRoutes.items) || !Array.isArray(ingresses.items)) {
         throw new Error('malformed list response');
@@ -118,7 +171,7 @@ export function createApp(config = {}) {
       return { ok: true, stale: false, body: lastGood };
     } catch (err) {
       const status = err.status === undefined ? '' : String(err.status);
-      console.error(`${err.name || err.constructor.name} ${status}`.trim());
+      cfg.logger.error(`${err.name ?? 'Error'} ${status}`.trim());
       if (lastGood !== null) return { ok: false, stale: true, body: lastGood };
       return { ok: false, stale: false, body: null };
     } finally {
@@ -144,19 +197,22 @@ export function createApp(config = {}) {
 
   const server = createServer(async (req, res) => {
     const started = Date.now();
+    const method = req.method || 'GET';
+    const isHead = method === 'HEAD';
+    // HEAD answers with the same status and headers as GET but never a body.
+    const finish = (body) => res.end(isHead ? undefined : body);
     let status = 200;
     try {
-      const method = req.method || 'GET';
       const pathname = (req.url || '/').split('?')[0];
       if (method !== 'GET' && method !== 'HEAD') {
         status = 404;
         res.writeHead(404);
-        res.end();
+        finish();
         return;
       }
       if (pathname === '/healthz') {
         res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
-        res.end('ok');
+        finish('ok');
         return;
       }
       if (pathname === '/services.json') {
@@ -166,39 +222,44 @@ export function createApp(config = {}) {
             'content-type': 'application/json; charset=utf-8',
             'cache-control': 'no-cache',
           });
-          res.end(result.body);
+          finish(result.body);
         } else if (result.stale) {
           res.writeHead(200, {
             'content-type': 'application/json; charset=utf-8',
             'cache-control': 'no-cache',
             Warning: WARNING_STALE,
           });
-          res.end(result.body);
+          finish(result.body);
         } else {
           status = 503;
           res.writeHead(503, { 'content-type': 'application/json; charset=utf-8' });
-          res.end(JSON.stringify({ error: 'discovery unavailable' }));
+          finish(JSON.stringify({ error: 'discovery unavailable' }));
         }
         return;
       }
       status = 404;
       res.writeHead(404);
-      res.end();
+      finish();
     } catch (err) {
       status = 500;
-      console.error(`InternalError ${err.message}`);
+      cfg.logger.error(`${err.name ?? 'Error'} 500`);
       if (!res.headersSent) {
         res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' });
       }
-      res.end('internal error');
+      finish('internal error');
     } finally {
-      console.log(`${req.method || 'GET'} ${req.url || '/'} ${status} ${Date.now() - started}`);
+      cfg.logger.info(`${method} ${accessPath(req)} ${status} ${Date.now() - started}`);
     }
   });
 
   return {
     server,
     close() {
+      // Cancel in-flight upstream requests so close() never waits behind a stalled refresh.
+      for (const req of pendingRequests) {
+        req.destroy(new Error('closing'));
+      }
+      pendingRequests.clear();
       return new Promise((resolve) => {
         server.close(resolve);
         server.closeIdleConnections();

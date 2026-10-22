@@ -98,6 +98,7 @@ describe('cardsFromObjects', () => {
 
   it('skips objects with hidden=true and keeps hidden=false', () => {
     const hidden = ingressRoute('hidden', 'default', {
+      routes: [{ match: 'Host(`hidden.example`)' }],
       annotations: { [A + 'hidden']: 'true' },
     });
     const shown = ingressRoute('shown', 'default', {
@@ -105,6 +106,23 @@ describe('cardsFromObjects', () => {
     });
     const out = cardsFromObjects({ ingressRoutes: [hidden, shown], ingresses: [] });
     expect(out).toEqual({ Unsorted: [card('a.example')] });
+  });
+
+  it('keeps a section named __proto__ or constructor as an own key', () => {
+    const proto = ingressRoute('proto', 'default', {
+      annotations: { [A + 'section']: '__proto__' },
+    });
+    const roundTripped = JSON.parse(JSON.stringify(cardsFromObjects({ ingressRoutes: [proto], ingresses: [] })));
+    expect(Object.keys(roundTripped)).toContain('__proto__');
+    expect(roundTripped.__proto__).toEqual([card('a.example')]);
+
+    const ctor = ingressRoute('ctor', 'default', {
+      routes: [{ match: 'Host(`c.example`)' }],
+      annotations: { [A + 'section']: 'constructor' },
+    });
+    const ctorOut = JSON.parse(JSON.stringify(cardsFromObjects({ ingressRoutes: [ctor], ingresses: [] })));
+    expect(Object.keys(ctorOut)).toContain('constructor');
+    expect(ctorOut.constructor).toEqual([card('c.example')]);
   });
 
   it('applies annotation defaults', () => {
