@@ -199,6 +199,7 @@ export function createApp(config = {}) {
   let lastGoodAt = 0;
   let lastAttemptAt = 0;
   let inFlight = null;
+  let closed = false;
 
   async function doRefresh() {
     try {
@@ -206,6 +207,8 @@ export function createApp(config = {}) {
         readFile(cfg.tokenFile, 'utf8').then((t) => t.trim()),
         cfg.apiUrl.startsWith('https://') ? readFile(cfg.caFile) : Promise.resolve(undefined),
       ]);
+      // close() may have run while the token and CA were being read: start nothing after it.
+      if (closed) throw new Error('closed');
       const [ingressRoutes, ingresses] = await Promise.all([
         getJson(`${cfg.apiUrl}${INGRESSROUTES_PATH}`, { token, ca, requests: pendingRequests }),
         getJson(`${cfg.apiUrl}${INGRESSES_PATH}`, { token, ca, requests: pendingRequests }),
@@ -311,6 +314,7 @@ export function createApp(config = {}) {
   return {
     server,
     close() {
+      closed = true;
       // Cancel in-flight upstream requests so close() never waits behind a stalled refresh.
       for (const req of pendingRequests) {
         req.destroy(new Error('closing'));

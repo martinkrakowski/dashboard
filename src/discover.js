@@ -1,6 +1,18 @@
 // Pure functions turning IngressRoute and Ingress objects into dashboard cards (fleet plan F61,
 // F62). No node:http / node:fs here so this module is testable without a server.
 
+/** An annotated href is used only when it is an http(s) URL; anything else (javascript:, data:,
+ * a bare word) falls back, since the page writes the value into an anchor. */
+export function safeHref(value, fallback) {
+  if (typeof value !== 'string') return fallback;
+  try {
+    const { protocol } = new URL(value);
+    return protocol === 'https:' || protocol === 'http:' ? value : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 export const ANNOTATION_PREFIX = 'dashboard.krakowski.cloud/';
 
 export const DEFAULT_EXCLUDED_NAMESPACES = [
@@ -145,7 +157,7 @@ export function cardsFromObjects(
             type: annotationValue(annotations, 'type') ?? 'Service',
             icon: annotationValue(annotations, 'icon') ?? 'fa-cloud',
             description: annotationValue(annotations, 'description') ?? '',
-            href: annotationValue(annotations, 'href') ?? `https://${host}`,
+            href: safeHref(annotationValue(annotations, 'href'), `https://${host}`),
           }
         : {
             name: host,

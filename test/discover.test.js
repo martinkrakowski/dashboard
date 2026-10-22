@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { ANNOTATION_PREFIX, hostsFromMatch, cardsFromObjects } from '../src/discover.js';
+import { ANNOTATION_PREFIX, hostsFromMatch, cardsFromObjects, safeHref } from '../src/discover.js';
 
 const A = ANNOTATION_PREFIX;
 
@@ -278,5 +278,23 @@ describe('cardsFromObjects', () => {
         { excludedNamespaces: ['default'] },
       ),
     ).toEqual({ Unsorted: [card('a.example')] });
+  });
+});
+
+describe('safeHref', () => {
+  it('keeps http and https, falls back for other schemes and junk', () => {
+    expect(safeHref('https://a.example/x', 'https://d')).toBe('https://a.example/x');
+    expect(safeHref('http://a.example', 'https://d')).toBe('http://a.example');
+    expect(safeHref('javascript:alert(1)', 'https://d')).toBe('https://d');
+    expect(safeHref('data:text/html,hi', 'https://d')).toBe('https://d');
+    expect(safeHref('not a url', 'https://d')).toBe('https://d');
+    expect(safeHref(undefined, 'https://d')).toBe('https://d');
+  });
+  it('is applied to the href annotation', () => {
+    const route = ingressRoute('r', 'default', {
+      annotations: { [A + 'href']: 'javascript:alert(1)' },
+    });
+    const out = cardsFromObjects({ ingressRoutes: [route], ingresses: [] });
+    expect(out.Unsorted[0].href).toBe('https://a.example');
   });
 });
