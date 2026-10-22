@@ -12,7 +12,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-node@{"message":"Not Found","documentation_url":"https://docs.github.com/rest/git/tags#get-a-tag","status":"404"}49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
         with:
           node-version-file: .nvmrc
       # After setup-node, so the shims land on the Node 22 that is on PATH.
