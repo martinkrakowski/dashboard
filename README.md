@@ -18,8 +18,10 @@ Annotations on an IngressRoute or Ingress (all optional):
 | `dashboard.krakowski.cloud/type` | the small label on the card | `Service` |
 | `dashboard.krakowski.cloud/icon` | Font Awesome class | `fa-cloud` |
 | `dashboard.krakowski.cloud/description` | one line | empty |
-| `dashboard.krakowski.cloud/href` | link | `https://<first host>` |
-| `dashboard.krakowski.cloud/hidden` | `"true"` hides the route | shown |
+| `dashboard.krakowski.cloud/href` | link | `https://<host>` |
+| `dashboard.krakowski.cloud/hidden` | `"true"` hides the host, even when another object serves it | shown |
+
+An object with several hosts yields one card per host: the annotations above apply to its first host only, and every other host gets a default card (name and link from the host) in the same section.
 
 Run the tests with `yarn test`. The image is built by `.github/workflows/build-image.yml` on `main`
 and promoted by digest with a platform pull request.

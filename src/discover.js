@@ -20,37 +20,42 @@ export const DEFAULT_EXCLUDED_NAMESPACES = [
   'ack-webhook',
 ];
 
-// Every host in a Traefik match string, e.g. `Host(`a.example`) || Host(`b.example`) &&
-// PathPrefix(`/api/`)` gives ['a.example', 'b.example']; no hosts gives [].
+// Every host in a Traefik match string: `Host(`a.example`) || Host(`b.example`) &&
+// PathPrefix(`/api/`)` gives ['a.example', 'b.example'], and the Traefik v2 multi-argument form
+// `Host(`a.example`, `b.example`)` gives both hosts too; no hosts gives [].
 export function hostsFromMatch(match) {
   if (typeof match !== 'string') return [];
   const hosts = [];
-  const re = /Host\(\s*`([^`]*)`\s*\)/g;
+  const call = /Host\(([^)]*)\)/g;
+  const quoted = /`([^`]*)`/g;
   let found;
-  while ((found = re.exec(match)) !== null) {
-    for (const part of found[1].split(',')) {
-      const host = part.trim();
-      if (host) hosts.push(host);
+  while ((found = call.exec(match)) !== null) {
+    quoted.lastIndex = 0;
+    let argument;
+    while ((argument = quoted.exec(found[1])) !== null) {
+      for (const part of argument[1].split(',')) {
+        const host = part.trim();
+        if (host) hosts.push(host);
+      }
     }
   }
   return hosts;
 }
 
 function annotationsOf(obj) {
-  const annotations = obj && obj.metadata && obj.metadata.annotations;
+  const annotations = obj?.metadata?.annotations;
   return annotations && typeof annotations === 'object' ? annotations : {};
+}
+
+// An annotation value, or undefined when it is absent, empty or whitespace-only: an empty value
+// behaves like no value at all, so the defaults apply.
+function annotationValue(annotations, name) {
+  const value = annotations[ANNOTATION_PREFIX + name];
+  return typeof value === 'string' && value.trim() !== '' ? value : undefined;
 }
 
 function isAnnotated(annotations) {
   return Object.keys(annotations).some((key) => key.startsWith(ANNOTATION_PREFIX));
-}
-
-function isSkipped(obj, excludedNamespaces) {
-  const meta = obj && obj.metadata;
-  if (!meta || typeof meta !== 'object') return true;
-  if (excludedNamespaces.has(meta.namespace)) return true;
-  const annotations = annotationsOf(obj);
-  return annotations[ANNOTATION_PREFIX + 'hidden'] === 'true';
 }
 
 // IngressRoute hosts: only when spec.entryPoints includes websecure; hosts come from every
@@ -95,43 +100,61 @@ export function cardsFromObjects(
   { excludedNamespaces = DEFAULT_EXCLUDED_NAMESPACES } = {},
 ) {
   const excluded = new Set(excludedNamespaces);
-  // host -> { obj, annotated }; one card per distinct host, first object wins except an annotated
-  // object beats an unannotated one for the same host.
+  // host -> { obj, firstHost, annotated }; one card per distinct host, the first object wins except
+  // that an object carrying any annotation beats an unannotated one for the same host.
   const chosen = new Map();
+  // Hidden applies after collecting (plan F61): a host an object marks hidden stays hidden even
+  // when another, unannotated object serves it.
+  const hiddenHosts = new Set();
 
   const consider = (obj, hosts) => {
     if (!hosts) return;
-    if (isSkipped(obj, excluded)) return;
-    const annotated = isAnnotated(annotationsOf(obj));
+    const meta = obj?.metadata;
+    if (!meta || typeof meta !== 'object' || excluded.has(meta.namespace)) return;
+    const annotations = annotationsOf(obj);
+    if (annotationValue(annotations, 'hidden') === 'true') {
+      for (const host of hosts) hiddenHosts.add(host);
+      return;
+    }
+    const annotated = isAnnotated(annotations);
     for (const host of hosts) {
       const current = chosen.get(host);
-      if (!current) {
-        chosen.set(host, { obj, annotated });
-      } else if (annotated && !current.annotated) {
-        chosen.set(host, { obj, annotated });
+      if (!current || (annotated && !current.annotated)) {
+        chosen.set(host, { obj, firstHost: hosts[0], annotated });
       }
     }
   };
 
   for (const obj of Array.isArray(ingressRoutes) ? ingressRoutes : []) {
-    consider(obj, ingressRouteHosts(obj && obj.spec));
+    consider(obj, ingressRouteHosts(obj?.spec));
   }
   for (const obj of Array.isArray(ingresses) ? ingresses : []) {
-    consider(obj, ingressHosts(obj && obj.spec));
+    consider(obj, ingressHosts(obj?.spec));
   }
 
   const sections = new Map();
-  for (const [host, { obj }] of chosen) {
+  for (const [host, { obj, firstHost }] of chosen) {
+    if (hiddenHosts.has(host)) continue;
     const annotations = annotationsOf(obj);
-    const prefix = ANNOTATION_PREFIX;
-    const card = {
-      name: annotations[prefix + 'name'] ?? host,
-      type: annotations[prefix + 'type'] ?? 'Service',
-      icon: annotations[prefix + 'icon'] ?? 'fa-cloud',
-      description: annotations[prefix + 'description'] ?? '',
-      href: annotations[prefix + 'href'] ?? `https://${host}`,
-    };
-    const section = annotations[prefix + 'section'] ?? 'Unsorted';
+    // The annotated card fields apply to the object's first host only; every other host of the
+    // same object gets the default card, in the same section.
+    const card =
+      host === firstHost
+        ? {
+            name: annotationValue(annotations, 'name') ?? host,
+            type: annotationValue(annotations, 'type') ?? 'Service',
+            icon: annotationValue(annotations, 'icon') ?? 'fa-cloud',
+            description: annotationValue(annotations, 'description') ?? '',
+            href: annotationValue(annotations, 'href') ?? `https://${host}`,
+          }
+        : {
+            name: host,
+            type: 'Service',
+            icon: 'fa-cloud',
+            description: '',
+            href: `https://${host}`,
+          };
+    const section = annotationValue(annotations, 'section') ?? 'Unsorted';
     if (!sections.has(section)) sections.set(section, []);
     sections.get(section).push(card);
   }

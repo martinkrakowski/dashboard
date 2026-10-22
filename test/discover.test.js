@@ -1,10 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import {
-  ANNOTATION_PREFIX,
-  DEFAULT_EXCLUDED_NAMESPACES,
-  hostsFromMatch,
-  cardsFromObjects,
-} from '../src/discover.js';
+import { ANNOTATION_PREFIX, hostsFromMatch, cardsFromObjects } from '../src/discover.js';
 
 const A = ANNOTATION_PREFIX;
 
@@ -51,6 +46,10 @@ describe('hostsFromMatch', () => {
     ]);
   });
 
+  it('extracts every host from the Traefik v2 multi-argument form', () => {
+    expect(hostsFromMatch('Host(`a.example`, `b.example`)')).toEqual(['a.example', 'b.example']);
+  });
+
   it('returns [] when there are no hosts', () => {
     expect(hostsFromMatch('PathPrefix(`/api/`) && Method(`GET`)')).toEqual([]);
     expect(hostsFromMatch('')).toEqual([]);
@@ -87,6 +86,33 @@ describe('cardsFromObjects', () => {
     expect(out.Unsorted.map((c) => c.name).sort()).toEqual(['a.example', 'b.example', 'c.example']);
   });
 
+  it('gives a multi-host object one card per host, annotated on the first host only', () => {
+    const r = ingressRoute('multi', 'default', {
+      routes: [{ match: 'Host(`a.example`) || Host(`b.example`)' }],
+      annotations: {
+        [A + 'section']: 'Apps',
+        [A + 'name']: 'Annotated',
+        [A + 'type']: 'Kind',
+        [A + 'icon']: 'fa-cube',
+        [A + 'description']: 'the first host',
+        [A + 'href']: 'https://a.example/app',
+      },
+    });
+    const out = cardsFromObjects({ ingressRoutes: [r], ingresses: [] });
+    expect(out).toEqual({
+      Apps: [
+        {
+          name: 'Annotated',
+          type: 'Kind',
+          icon: 'fa-cube',
+          description: 'the first host',
+          href: 'https://a.example/app',
+        },
+        card('b.example'),
+      ],
+    });
+  });
+
   it('skips excluded namespaces', () => {
     const r = ingressRoute('r', 'kube-system');
     expect(cardsFromObjects({ ingressRoutes: [r], ingresses: [] })).toEqual({});
@@ -106,6 +132,17 @@ describe('cardsFromObjects', () => {
     });
     const out = cardsFromObjects({ ingressRoutes: [hidden, shown], ingresses: [] });
     expect(out).toEqual({ Unsorted: [card('a.example')] });
+  });
+
+  it('hides a host that any object marks hidden, even when another object serves it', () => {
+    const hidden = ingressRoute('hidden', 'default', {
+      routes: [{ match: 'Host(`shared.example`)' }],
+      annotations: { [A + 'name']: 'Hidden', [A + 'hidden']: 'true' },
+    });
+    const plain = ingressRoute('plain', 'default', {
+      routes: [{ match: 'Host(`shared.example`)' }],
+    });
+    expect(cardsFromObjects({ ingressRoutes: [hidden, plain], ingresses: [] })).toEqual({});
   });
 
   it('keeps a section named __proto__ or constructor as an own key', () => {
@@ -131,6 +168,14 @@ describe('cardsFromObjects', () => {
     expect(out).toEqual({ Unsorted: [card('a.example')] });
   });
 
+  it('treats an empty or whitespace-only annotation value as absent', () => {
+    const r = ingressRoute('r', 'default', {
+      annotations: { [A + 'name']: '', [A + 'href']: '   ' },
+    });
+    const out = cardsFromObjects({ ingressRoutes: [r], ingresses: [] });
+    expect(out).toEqual({ Unsorted: [card('a.example')] });
+  });
+
   it('an annotated object beats an unannotated one for the same host', () => {
     const plain = ingressRoute('plain', 'default');
     const annotated = ingressRoute('annotated', 'default', {
@@ -149,9 +194,14 @@ describe('cardsFromObjects', () => {
       annotations: { [A + 'name']: 'Second' },
     });
     expect(cardsFromObjects({ ingressRoutes: [first, second], ingresses: [] }).Unsorted[0].name).toBe('First');
-    const p1 = ingressRoute('p1', 'default');
+    // Two unannotated objects for the same host would give identical cards, so the first one
+    // carries a distinguishing type: if the second object won the host, the type would differ.
+    const p1 = ingressRoute('p1', 'default', { annotations: { [A + 'type']: 'Winner' } });
     const p2 = ingressRoute('p2', 'default');
-    expect(cardsFromObjects({ ingressRoutes: [p1, p2], ingresses: [] }).Unsorted[0].name).toBe('a.example');
+    const out = cardsFromObjects({ ingressRoutes: [p1, p2], ingresses: [] });
+    expect(out.Unsorted).toHaveLength(1);
+    expect(out.Unsorted[0].name).toBe('a.example');
+    expect(out.Unsorted[0].type).toBe('Winner');
   });
 
   it('dedupes to one card per host', () => {
@@ -212,22 +262,21 @@ describe('cardsFromObjects', () => {
     expect(cardsFromObjects({ ingressRoutes: badRoutes, ingresses: badIngresses })).toEqual({});
   });
 
-  it('exposes the expected default excluded namespaces', () => {
-    expect(DEFAULT_EXCLUDED_NAMESPACES).toEqual([
-      'kube-system',
-      'kube-public',
-      'kube-node-lease',
-      'flux-system',
-      'traefik',
-      'cert-manager',
-      'kyverno',
-      'cnpg-system',
-      'external-secrets',
-      'keda',
-      'monitoring',
-      'kured',
-      'secrets-source',
-      'ack-webhook',
-    ]);
+  it('excludes the namespaces on the default list and honours a custom one', () => {
+    const inTraefik = ingressRoute('in-traefik', 'traefik');
+    const inDefault = ingressRoute('in-default', 'default', {
+      routes: [{ match: 'Host(`kept.example`)' }],
+    });
+    // `traefik` is on the default exclusion list, `default` is not: only the `default` object shows.
+    expect(cardsFromObjects({ ingressRoutes: [inTraefik, inDefault], ingresses: [] })).toEqual({
+      Unsorted: [card('kept.example')],
+    });
+    // A custom list replaces the default: `default` is now excluded, `traefik` is not.
+    expect(
+      cardsFromObjects(
+        { ingressRoutes: [inTraefik, inDefault], ingresses: [] },
+        { excludedNamespaces: ['default'] },
+      ),
+    ).toEqual({ Unsorted: [card('a.example')] });
   });
 });

@@ -1,8 +1,7 @@
 // The discovery service (fleet plan F64): answers GET /services.json from the cluster's Traefik
 // IngressRoutes and Ingresses, cached, with a last-good fallback. Read-only, standard library only.
 
-import { createServer } from 'node:http';
-import { request as httpRequest } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
@@ -13,6 +12,9 @@ const BODY_LIMIT_BYTES = 8 * 1024 * 1024;
 const INGRESSROUTES_PATH = '/apis/traefik.io/v1alpha1/ingressroutes';
 const INGRESSES_PATH = '/apis/networking.k8s.io/v1/ingresses';
 const WARNING_STALE = '110 - "stale"';
+const DEFAULT_CACHE_SECONDS = 30;
+// The plain http transport exists for tests only, against a loopback API.
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1']);
 
 class ApiError extends Error {
   constructor(status) {
@@ -34,28 +36,64 @@ const defaultLogger = {
   error: (line) => process.stderr.write(`${line}\n`),
 };
 
-function parseConfig(config) {
+// CACHE_SECONDS must be a non-negative number; anything else falls back to the default, with one
+// line through the logger when a value was given but could not be used.
+function parseCacheSeconds(raw, logger) {
+  if (raw === undefined) return DEFAULT_CACHE_SECONDS;
+  const text = String(raw).trim();
+  const value = text === '' ? NaN : Number(text);
+  if (Number.isFinite(value) && value >= 0) return value;
+  logger.error(`invalid CACHE_SECONDS; using the default ${DEFAULT_CACHE_SECONDS}`);
+  return DEFAULT_CACHE_SECONDS;
+}
+
+// `http://` is accepted solely for a loopback host (tests); any other http URL is a configuration
+// error. The message names the scheme, never the URL, which could carry credentials.
+function assertTransportAllowed(apiUrl) {
+  let target;
+  try {
+    target = new URL(apiUrl);
+  } catch {
+    return; // an unparseable URL fails later, at request time, as before
+  }
+  // An IPv6 URL's hostname keeps its brackets; compare without them.
+  const hostname =
+    target.hostname.startsWith('[') && target.hostname.endsWith(']')
+      ? target.hostname.slice(1, -1)
+      : target.hostname;
+  if (target.protocol === 'http:' && !LOOPBACK_HOSTS.has(hostname)) {
+    throw new Error(
+      `insecure http API URL: http:// is only allowed for 127.0.0.1, localhost or ::1`,
+    );
+  }
+}
+
+export function parseConfig(config) {
   const env = process.env;
   const excludedRaw = config.EXCLUDED_NAMESPACES ?? env.EXCLUDED_NAMESPACES;
   const host = config.KUBERNETES_SERVICE_HOST ?? env.KUBERNETES_SERVICE_HOST;
   const port = config.KUBERNETES_SERVICE_PORT ?? env.KUBERNETES_SERVICE_PORT;
+  const logger = config.logger ?? defaultLogger;
+  let apiUrl = config.KUBE_API_URL ?? env.KUBE_API_URL ?? defaultApiUrl(host, port);
+  while (apiUrl.endsWith('/')) apiUrl = apiUrl.slice(0, -1);
+  assertTransportAllowed(apiUrl);
   return {
-    apiUrl: (config.KUBE_API_URL ?? env.KUBE_API_URL ?? defaultApiUrl(host, port)).replace(/\/+$/, ''),
+    apiUrl,
     tokenFile: config.KUBE_TOKEN_FILE ?? env.KUBE_TOKEN_FILE ?? '/var/run/secrets/kubernetes.io/serviceaccount/token',
     caFile: config.KUBE_CA_FILE ?? env.KUBE_CA_FILE ?? '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt',
-    cacheSeconds: Number(config.CACHE_SECONDS ?? env.CACHE_SECONDS ?? 30),
+    cacheSeconds: parseCacheSeconds(config.CACHE_SECONDS ?? env.CACHE_SECONDS, logger),
     excludedNamespaces:
       excludedRaw === undefined
         ? DEFAULT_EXCLUDED_NAMESPACES
         : String(excludedRaw).split(',').map((s) => s.trim()).filter(Boolean),
-    logger: config.logger ?? defaultLogger,
+    logger,
   };
 }
 
 // The path for the access log: pathname only, never the query string (it can carry secrets).
 function accessPath(req) {
   try {
-    return new URL(req.url || '/', 'http://x').pathname;
+    return new URL(req.url || '/', 'http://127.0.0.1').pathname;
   } catch {
     return (req.url || '/').split('?')[0];
   }
@@ -107,6 +145,7 @@ function getJson(url, { token, ca, requests }) {
         if (received > BODY_LIMIT_BYTES) {
           const tooLarge = new Error('upstream body exceeds the limit');
           tooLarge.name = 'BodyTooLarge';
+          settle(reject, tooLarge);
           req.destroy(tooLarge);
           return;
         }
@@ -128,11 +167,23 @@ function getJson(url, { token, ca, requests }) {
         }
         settle(resolve, parsed);
       });
+      // An upstream that closes the socket after the headers destroys the response with
+      // ECONNRESET and emits neither `end` nor an `error` on the request; without these listeners
+      // the promise would never settle and the single-flight refresh slot would hang forever.
+      res.on('error', (err) => settle(reject, err));
+      res.on('close', () => {
+        if (!res.complete) settle(reject, new Error('upstream closed early'));
+      });
     });
     requests.add(req);
-    // Total deadline from the start of the request, in addition to the socket inactivity timeout.
-    deadline = setTimeout(() => req.destroy(new Error('timeout')), REQUEST_TIMEOUT_MS);
+    // Total deadline from the start of the request. Settle directly: destroying an already
+    // destroyed request returns early and emits nothing, so the promise must not rely on it.
+    deadline = setTimeout(() => {
+      settle(reject, new Error('timeout'));
+      req.destroy(new Error('timeout'));
+    }, REQUEST_TIMEOUT_MS);
     req.on('timeout', () => {
+      settle(reject, new Error('request timeout'));
       req.destroy(new Error('request timeout'));
     });
     req.on('error', (err) => settle(reject, err));
@@ -160,7 +211,7 @@ export function createApp(config = {}) {
         getJson(`${cfg.apiUrl}${INGRESSES_PATH}`, { token, ca, requests: pendingRequests }),
       ]);
       if (!Array.isArray(ingressRoutes.items) || !Array.isArray(ingresses.items)) {
-        throw new Error('malformed list response');
+        throw new TypeError('malformed list response');
       }
       const cards = cardsFromObjects(
         { ingressRoutes: ingressRoutes.items, ingresses: ingresses.items },
@@ -251,6 +302,11 @@ export function createApp(config = {}) {
       cfg.logger.info(`${method} ${accessPath(req)} ${status} ${Date.now() - started}`);
     }
   });
+
+  // Inbound limits: a slow or stalled client must not hold a connection open indefinitely.
+  server.requestTimeout = 10_000;
+  server.headersTimeout = 5_000;
+  server.maxConnections = 256;
 
   return {
     server,

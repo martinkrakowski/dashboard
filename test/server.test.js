@@ -4,7 +4,7 @@ import { once } from 'node:events';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createApp, defaultApiUrl } from '../src/server.js';
+import { createApp, defaultApiUrl, parseConfig } from '../src/server.js';
 
 const TOKEN = 'test-token';
 
@@ -122,6 +122,31 @@ async function startHugeApi() {
   return {
     server,
     url: `http://127.0.0.1:${server.address().port}`,
+  };
+}
+
+// An API that answers with the headers and half a JSON body, then destroys the socket. The destroy
+// is delayed so the headers arrive first: the response is then established, the request emits no
+// `error`, and only the response listeners can settle it.
+async function startEarlyCloseApi() {
+  let broken = true;
+  const server = createServer((req, res) => {
+    if (!broken) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ items: [] }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.write('{"items": [');
+    setTimeout(() => res.socket.destroy(), 100);
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return {
+    server,
+    url: `http://127.0.0.1:${server.address().port}`,
+    setBroken: (value) => {
+      broken = value;
+    },
   };
 }
 
@@ -256,6 +281,49 @@ describe('server', () => {
     expect(defaultApiUrl('10.0.0.1', '443')).toBe('https://10.0.0.1:443');
   });
 
+  it('falls back to a 30 s cache for an invalid CACHE_SECONDS, with one log line', () => {
+    const lines = [];
+    const logger = captureLogger(lines);
+    expect(parseConfig({ CACHE_SECONDS: 'abc', logger }).cacheSeconds).toBe(30);
+    expect(parseConfig({ CACHE_SECONDS: -1, logger }).cacheSeconds).toBe(30);
+    expect(parseConfig({ CACHE_SECONDS: '', logger }).cacheSeconds).toBe(30);
+    expect(lines).toHaveLength(3);
+    for (const line of lines) {
+      expect(line).toContain('CACHE_SECONDS');
+    }
+
+    expect(parseConfig({ CACHE_SECONDS: 0, logger }).cacheSeconds).toBe(0);
+    expect(parseConfig({ CACHE_SECONDS: '5', logger }).cacheSeconds).toBe(5);
+    expect(parseConfig({ logger }).cacheSeconds).toBe(30);
+    expect(lines).toHaveLength(3);
+  });
+
+  it('caps inbound requests and connections', async () => {
+    const app = createApp({ logger: captureLogger([]) });
+    expect(app.server.requestTimeout).toBe(10000);
+    expect(app.server.headersTimeout).toBe(5000);
+    expect(app.server.maxConnections).toBe(256);
+    await app.close();
+  });
+
+  it('rejects a non-loopback http API URL at startup, without echoing the URL', () => {
+    expect(() => createApp({ KUBE_API_URL: 'http://10.0.0.5:8080' })).toThrow(/http/);
+
+    let err;
+    try {
+      createApp({ KUBE_API_URL: 'http://user:secret@10.0.0.5:8080' });
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toMatch(/http/);
+    expect(err.message).not.toContain('secret');
+
+    for (const url of ['http://127.0.0.1:8080', 'http://localhost:8080', 'http://[::1]:8080']) {
+      expect(() => parseConfig({ KUBE_API_URL: url, logger: captureLogger([]) })).not.toThrow();
+    }
+  });
+
   it('answers 503 within the total deadline when an upstream stalls forever', async () => {
     const fake = await startStalledApi();
     const { app, base, temp } = await startApp(fake, 0);
@@ -266,6 +334,26 @@ describe('server', () => {
       expect(res.status).toBe(503);
       expect(await res.json()).toEqual({ error: 'discovery unavailable' });
       expect(elapsed).toBeLessThan(6000);
+    } finally {
+      await stop(fake, app, temp);
+    }
+  }, 10000);
+
+  it('answers 503 within 2 s when the upstream closes mid-body, then recovers', async () => {
+    const fake = await startEarlyCloseApi();
+    const { app, base, temp } = await startApp(fake, 0);
+    try {
+      const startedAt = Date.now();
+      const res = await fetch(`${base}/services.json`);
+      expect(res.status).toBe(503);
+      expect(await res.json()).toEqual({ error: 'discovery unavailable' });
+      expect(Date.now() - startedAt).toBeLessThan(2000);
+
+      // The refresh slot must have been released: a healthy upstream serves the next request.
+      fake.setBroken(false);
+      const second = await fetch(`${base}/services.json`);
+      expect(second.status).toBe(200);
+      expect(await second.json()).toEqual({});
     } finally {
       await stop(fake, app, temp);
     }
@@ -370,6 +458,24 @@ describe('server', () => {
       for (const line of lines) {
         expect(line).not.toContain(TOKEN);
       }
+    } finally {
+      await stop(fake, app, temp);
+    }
+  });
+
+  it('re-reads the token file at every refresh', async () => {
+    const fake = await startFakeApi();
+    const { app, base, temp } = await startApp(fake, 0);
+    try {
+      const first = await fetch(`${base}/services.json`);
+      expect(first.status).toBe(200);
+      expect(fake.seen.some((r) => r.authorization === `Bearer ${TOKEN}`)).toBe(true);
+
+      const nextToken = 'a-newer-token';
+      writeFileSync(temp.file, `${nextToken}\n`);
+      const second = await fetch(`${base}/services.json`);
+      expect(second.status).toBe(200);
+      expect(fake.seen[fake.seen.length - 1].authorization).toBe(`Bearer ${nextToken}`);
     } finally {
       await stop(fake, app, temp);
     }
