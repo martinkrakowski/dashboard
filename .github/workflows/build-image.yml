@@ -1,0 +1,115 @@
+# Build, scan, sign and publish the dashboard discovery image (platform/templates/build-image.yml, adapted).
+#
+# dashboard is a PUBLIC repository, so this runs on GitHub-hosted runners, never on the solstice
+# self-hosted pool: a pull request from a fork must not reach the owner's hosts. Every action is
+# pinned by commit. The image is linux/amd64 only: the one target is solstice's staging cluster,
+# and production is out of scope (fleet plan F68).
+#
+# - Pull requests build and scan with read-only permissions: no push, no signature.
+# - Only `main` gets packages:write and id-token:write: it pushes by digest, scans the pushed
+#   image, writes an SBOM, signs keyless (cosign, GitHub's OIDC) and attests the SBOM. The file
+#   name is part of the signing identity that platform's Kyverno policy accepts.
+# - Deploys never come from CI: promote the digest from the job summary with a pull request to
+#   martinkrakowski/platform (apps/staging/dashboard).
+name: build-image
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: build-image-${{ github.ref }}
+  # Never cancel main: a cancel between push and sign would leave an unsigned image in GHCR.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+defaults:
+  run:
+    shell: bash
+env:
+  IMAGE: ghcr.io/martinkrakowski/dashboard
+  PLATFORMS: linux/amd64
+jobs:
+  check:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+      - name: Build (no push)
+        run: docker buildx build --platform "$PLATFORMS" --load -t "scan-$GITHUB_RUN_ID" .
+      - name: Scan the image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          image-ref: scan-${{ github.run_id }}
+          exit-code: "1"
+          severity: CRITICAL
+          ignore-unfixed: true
+      - name: Clean up
+        if: always()
+        run: docker image rm "scan-$GITHUB_RUN_ID" 2>/dev/null || true
+
+  publish:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6  # v4.1.2
+      # The registry login never outlives this job.
+      - name: Keep the registry login inside this job's temp directory
+        run: echo "DOCKER_CONFIG=$RUNNER_TEMP/docker" >> "$GITHUB_ENV"
+      - name: Log in to GHCR with this job's own token
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Build and push
+        run: |
+          docker buildx build --platform "$PLATFORMS" --push --provenance=mode=max \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            -t "$IMAGE:sha-${GITHUB_SHA::12}" --metadata-file "$RUNNER_TEMP/meta.json" .
+          echo "DIGEST=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/meta.json")" >> "$GITHUB_ENV"
+      - name: Scan the pushed image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        env:
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          image-ref: ${{ env.IMAGE }}@${{ env.DIGEST }}
+          exit-code: "1"
+          severity: CRITICAL
+          ignore-unfixed: true
+      - name: SBOM
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c  # v0.24.3
+        with:
+          image: ${{ env.IMAGE }}@${{ env.DIGEST }}
+          format: spdx-json
+          output-file: ${{ runner.temp }}/sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+          registry-username: ${{ github.actor }}
+          registry-password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Signature and SBOM attestation (keyless, this workflow's identity)
+        run: |
+          # Classic signature format until Kyverno 1.19's verification of cosign 3 bundles is proved.
+          cosign sign --yes --new-bundle-format=false --use-signing-config=false "$IMAGE@$DIGEST"
+          cosign attest --yes --new-bundle-format=false --use-signing-config=false --type spdxjson \
+            --predicate "$RUNNER_TEMP/sbom.spdx.json" "$IMAGE@$DIGEST"
+      - name: Record the digest for the promotion pull request
+        run: |
+          echo "Promote with a platform pull request (apps/staging/dashboard): \`$IMAGE@$DIGEST\`" >> "$GITHUB_STEP_SUMMARY"
+      - name: Log out and clean up
+        if: always()
+        run: |
+          docker logout ghcr.io >/dev/null 2>&1 || true
+          rm -rf "$DOCKER_CONFIG"

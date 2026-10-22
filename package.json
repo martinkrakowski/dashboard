@@ -1,0 +1,19 @@
+{
+  "name": "dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "packageManager": "yarn@4.12.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "vitest run --passWithNoTests",
+    "check": "node --check src/server.js && node --check src/discover.js"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.9"
+  }
+}
